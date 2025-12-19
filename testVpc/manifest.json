@@ -1,4 +1,4 @@
 {
-  "action": "apply",
+  "action": "destroy",
   "stages": ["testVpc", "stateSub1", "stateSub2"]
 }
