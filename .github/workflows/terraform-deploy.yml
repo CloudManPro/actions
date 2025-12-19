@@ -1,9 +1,8 @@
-name: Advanced GitOps Terraform
+name: Pro-Level Terraform Pipeline
 
 on:
   push:
-    paths:
-      - '**/manifest.json'
+    paths: ['**/manifest.json']
   workflow_dispatch:
 
 permissions:
@@ -11,39 +10,10 @@ permissions:
   contents: read
 
 jobs:
-  terraform-deploy:
+  deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 2
-
-      - name: Detectar Gatilho e Processar
-        id: flow
-        run: |
-          # 1. Encontra qual manifest.json mudou
-          MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
-          
-          # Fallback para Re-run
-          if [ -z "$MANIFEST_PATH" ]; then
-            MANIFEST_PATH=$(find . -name "manifest.json" | head -n 1 | sed 's|./||')
-          fi
-
-          # 2. Extrai dados do manifesto
-          ACTION=$(jq -r '.action' "$MANIFEST_PATH")
-          STAGES=$(jq -r '.stages[]' "$MANIFEST_PATH")
-
-          # 3. Se for destroy, inverte a ordem (Subnets antes da VPC)
-          if [ "$ACTION" == "destroy" ]; then
-             STAGES=$(echo "$STAGES" | tac)
-          fi
-
-          echo "folder_trigger=$(dirname $MANIFEST_PATH)" >> $GITHUB_OUTPUT
-          echo "action=$ACTION" >> $GITHUB_OUTPUT
-          
-          # Transforma a lista de stages em uma string para o loop
-          echo "stages_list=$(echo $STAGES | tr '\n' ' ')" >> $GITHUB_OUTPUT
+      - uses: actions/checkout@v4
 
       - name: Configurar AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -51,22 +21,43 @@ jobs:
           role-to-assume: arn:aws:iam::952133486861:role/CloudManActions
           aws-region: us-east-1
 
-      - name: Setup Terraform
-        uses: hashicorp/setup-terraform@v3
+      - uses: hashicorp/setup-terraform@v3
 
-      - name: Executar Sequência Terraform
+      - name: Executar Pipeline Inteligente
         run: |
-          ACTION="${{ steps.flow.outputs.action }}"
-          STAGES="${{ steps.flow.outputs.stages_list }}"
+          ACTION=$(jq -r '.action' vpc/manifest.json)
           
-          for STAGE in $STAGES; do
-            echo "----------------------------------------"
-            echo ">>> ESTÁGIO: $STAGE | AÇÃO: $ACTION <<<"
-            echo "----------------------------------------"
+          # 1. Lê a pipeline. Se for destroy, inverte a ordem dos estágios
+          if [ "$ACTION" == "destroy" ]; then
+            STAGES=$(jq -c '.pipeline | reverse | .[]' vpc/manifest.json)
+          else
+            STAGES=$(jq -c '.pipeline[]' vpc/manifest.json)
+          fi
 
-            terraform -chdir=$STAGE init \
-              -backend-config="key=$STAGE/terraform.tfstate" \
-              -reconfigure
+          # 2. Loop pelos estágios sequenciais
+          echo "Iniciando Pipeline: $ACTION"
+          
+          for group in $STAGES; do
+            # Extrai os sub-itens (ex: ["subnet1", "subnet2"])
+            items=$(echo $group | jq -r '.[]')
+            count=$(echo $items | wc -w)
 
-            terraform -chdir=$STAGE $ACTION -auto-approve
+            echo "::group::Processando Estágio: $items"
+            
+            # Se houver mais de um item, roda em paralelo (&)
+            for item in $items; do
+              (
+                echo "Iniciando $item..."
+                terraform -chdir=$item init -backend-config="key=$item/terraform.tfstate" -reconfigure > /dev/null
+                terraform -chdir=$item $ACTION -auto-approve
+                echo "Finalizado: $item"
+              ) & 
+            done
+
+            # Espera todos os sub-itens do estágio atual terminarem
+            wait
+            echo "::endgroup::"
+
+            # Se algum falhou, interrompe a pipeline
+            if [ $? -ne 0 ]; then echo "Erro no estágio $items"; exit 1; fi
           done
