@@ -1,10 +1,9 @@
-name: CloudMan Dynamic Terraform
+name: Advanced GitOps Terraform
 
 on:
   push:
     paths:
       - '**/manifest.json'
-  # Permite rodar manualmente pela aba Actions se necessário
   workflow_dispatch:
 
 permissions:
@@ -12,48 +11,39 @@ permissions:
   contents: read
 
 jobs:
-  terraform-job:
+  terraform-deploy:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout Código
+      - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 2 # Necessário para o git diff funcionar
+          fetch-depth: 2
 
-      - name: Detectar Ambiente e Ação
-        id: info
+      - name: Detectar Gatilho e Processar
+        id: flow
         run: |
-          echo "### Iniciando Detecção ###"
-          
-          # 1. Tenta pegar a pasta pelo diff do Git
+          # 1. Encontra qual manifest.json mudou
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
           
-          # 2. Se for um Re-run ou o diff falhar, procura a primeira pasta com manifest.json
+          # Fallback para Re-run
           if [ -z "$MANIFEST_PATH" ]; then
-            echo "Aviso: Nenhuma mudança detectada via git diff. Buscando manifesto no diretório..."
-            MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1 | sed 's|./||')
+            MANIFEST_PATH=$(find . -name "manifest.json" | head -n 1 | sed 's|./||')
           fi
 
-          # Validação final
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "ERRO: Nenhum arquivo manifest.json encontrado no repositório!"
-            exit 1
-          fi
-
-          # 3. Extrai a pasta e a ação (apply/destroy)
-          FOLDER=$(dirname "$MANIFEST_PATH")
+          # 2. Extrai dados do manifesto
           ACTION=$(jq -r '.action' "$MANIFEST_PATH")
+          STAGES=$(jq -r '.stages[]' "$MANIFEST_PATH")
 
-          # 4. Salva para os próximos passos
-          echo "folder=$FOLDER" >> $GITHUB_OUTPUT
+          # 3. Se for destroy, inverte a ordem (Subnets antes da VPC)
+          if [ "$ACTION" == "destroy" ]; then
+             STAGES=$(echo "$STAGES" | tac)
+          fi
+
+          echo "folder_trigger=$(dirname $MANIFEST_PATH)" >> $GITHUB_OUTPUT
           echo "action=$ACTION" >> $GITHUB_OUTPUT
-
-          # 5. Logs visíveis no console do GitHub
-          echo "========================================"
-          echo "DIRETÓRIO DETECTADO: $FOLDER"
-          echo "AÇÃO NO MANIFESTO:   $ACTION"
-          echo "CAMINHO DO ARQUIVO:  $MANIFEST_PATH"
-          echo "========================================"
+          
+          # Transforma a lista de stages em uma string para o loop
+          echo "stages_list=$(echo $STAGES | tr '\n' ' ')" >> $GITHUB_OUTPUT
 
       - name: Configurar AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -64,13 +54,19 @@ jobs:
       - name: Setup Terraform
         uses: hashicorp/setup-terraform@v3
 
-      - name: Terraform Init
+      - name: Executar Sequência Terraform
         run: |
-          echo "Iniciando Terraform na pasta: ${{ steps.info.outputs.folder }}"
-          terraform -chdir=${{ steps.info.outputs.folder }} init \
-            -backend-config="key=${{ steps.info.outputs.folder }}/terraform.tfstate"
+          ACTION="${{ steps.flow.outputs.action }}"
+          STAGES="${{ steps.flow.outputs.stages_list }}"
+          
+          for STAGE in $STAGES; do
+            echo "----------------------------------------"
+            echo ">>> ESTÁGIO: $STAGE | AÇÃO: $ACTION <<<"
+            echo "----------------------------------------"
 
-      - name: Terraform Execution
-        run: |
-          echo ">>> EXECUTANDO: terraform ${{ steps.info.outputs.action }} <<<"
-          terraform -chdir=${{ steps.info.outputs.folder }} ${{ steps.info.outputs.action }} -auto-approve
+            terraform -chdir=$STAGE init \
+              -backend-config="key=$STAGE/terraform.tfstate" \
+              -reconfigure
+
+            terraform -chdir=$STAGE $ACTION -auto-approve
+          done
