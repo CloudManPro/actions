@@ -1,5 +1,4 @@
 {
   "action": "apply",
-  "stages": ["testVpc", "stateSub1", "stateSub2"],
-  "vr" : 10
+  "stages": ["testVpc", "stateSub1", "stateSub2"]
 }
