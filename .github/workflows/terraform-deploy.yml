@@ -20,39 +20,30 @@ jobs:
       - name: Detectar Manifest e Ação
         id: flow
         run: |
-          # 1. Detecta qual manifest.json mudou
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
           
-          # Fallback para Re-run (procura o primeiro manifesto que encontrar)
           if [ -z "$MANIFEST_PATH" ]; then
             MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1 | sed 's|./||')
           fi
 
-          if [ -z "$MANIFEST_PATH" ]; then
-            echo "ERRO: Nenhum manifest.json encontrado!"
-            exit 1
-          fi
-
           echo "Manifesto encontrado em: $MANIFEST_PATH"
 
-          # 2. Extrai a Ação
+          # Pega a ação (apply/destroy)
           ACTION=$(jq -r '.action' "$MANIFEST_PATH")
           
-          # 3. Extrai a Pipeline e inverte se for Destroy
+          # Pega os estágios. Se for destroy, inverte a ordem da lista principal
           if [ "$ACTION" == "destroy" ]; then
-            STAGES=$(jq -c '.pipeline | reverse | .[]' "$MANIFEST_PATH")
+            STAGES=$(jq -c '.stages | reverse | .[]' "$MANIFEST_PATH")
           else
-            STAGES=$(jq -c '.pipeline[]' "$MANIFEST_PATH")
+            STAGES=$(jq -c '.stages[]' "$MANIFEST_PATH")
           fi
 
-          # 4. Salva as saídas para os próximos passos
           echo "action=$ACTION" >> $GITHUB_OUTPUT
-          echo "stages_list=$(echo $STAGES | tr '\n' ' ')" >> $GITHUB_OUTPUT
+          # Salva a lista de estágios formatada para o Bash
+          echo "stages_list=$(echo $STAGES | tr '\n' '|') " >> $GITHUB_OUTPUT
           
-          echo "========================================"
           echo "AÇÃO: $ACTION"
-          echo "PIPELINE: $STAGES"
-          echo "========================================"
+          echo "STAGES: $STAGES"
 
       - name: Configurar AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -65,22 +56,26 @@ jobs:
       - name: Executar Pipeline
         run: |
           ACTION="${{ steps.flow.outputs.action }}"
-          STAGES='${{ steps.flow.outputs.stages_list }}'
+          # Converte a string de volta em lista usando o separador '|'
+          IFS='|' read -ra ADDR <<< "${{ steps.flow.outputs.stages_list }}"
           
-          for group in $STAGES; do
-            # Extrai os sub-itens do grupo (ex: vpc ou subnet1 subnet2)
-            items=$(echo $group | jq -r '.[]')
+          for group in "${ADDR[@]}"; do
+            if [ -z "$group" ]; then continue; fi
+            
+            # Extrai os itens do grupo (ex: vpc ou stateSub1 stateSub2)
+            # O 'if' abaixo trata se você passar uma lista simples ["a", "b"] ou aninhada [["a"], ["b"]]
+            items=$(echo $group | jq -r 'if type=="array" then .[] else . end')
             
             echo "::group::Processando Estágio: $items"
             
             for item in $items; do
               (
-                echo ">>> Iniciando Terraform em: $item"
+                echo ">>> Iniciando $item"
                 terraform -chdir=$item init -backend-config="key=$item/terraform.tfstate" -reconfigure > /dev/null
                 terraform -chdir=$item $ACTION -auto-approve
               ) & 
             done
 
-            wait # Espera o grupo paralelo terminar antes de ir para o próximo estágio sequencial
+            wait # Espera o grupo paralelo terminar
             echo "::endgroup::"
           done
