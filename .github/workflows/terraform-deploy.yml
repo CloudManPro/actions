@@ -1,0 +1,52 @@
+name: Dynamic Terraform Deploy
+
+on:
+  push:
+    paths:
+      - '**/manifest.json' # Dispara se qualquer manifest.json em qualquer pasta mudar
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # Necessário para comparar o commit atual com o anterior
+
+      - name: Detectar Pasta Alterada
+        id: detect
+        run: |
+          # Encontra qual manifest.json foi alterado
+          FILE=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
+          # Pega o nome da pasta (ex: vpc-teste)
+          DIR=$(dirname $FILE)
+          echo "folder=$DIR" >> $GITHUB_OUTPUT
+          echo "Trabalhando na pasta: $DIR"
+
+      - name: Configurar AWS (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::952133486861:role/CloudManActions
+          aws-region: us-east-1
+
+      - name: Setup Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform Init Dinâmico
+        run: |
+          # O segredo: passamos a key do S3 baseada no nome da pasta
+          terraform -chdir=${{ steps.detect.outputs.folder }} init \
+            -backend-config="key=${{ steps.detect.outputs.folder }}/terraform.tfstate"
+
+      - name: Executar Action do Manifesto
+        run: |
+          FOLDER=${{ steps.detect.outputs.folder }}
+          ACTION=$(jq -r '.action' $FOLDER/manifest.json)
+          
+          echo "Executando $ACTION em $FOLDER"
+          terraform -chdir=$FOLDER $ACTION -auto-approve
