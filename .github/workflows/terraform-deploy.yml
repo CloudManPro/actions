@@ -1,9 +1,11 @@
-name: Dynamic Pro-Level Pipeline
+name: Dynamic GitOps Pipeline
 
 on:
   push:
-    paths: ['**/manifest.json']
-  workflow_dispatch:
+    paths:
+      - '**/manifest.json'
+      - '**/main.tf'        # AGORA DISPARA SE VOCÊ CORRIGIR O TERRAFORM!
+  workflow_dispatch:        # BOTÃO PARA RODAR MANUALMENTE
 
 permissions:
   id-token: write
@@ -17,33 +19,30 @@ jobs:
         with:
           fetch-depth: 2
 
-      - name: Detectar Manifest e Ação
+      - name: Detectar Manifest e Configurar Pipeline
         id: flow
         run: |
+          # 1. Busca o manifesto (no arquivo alterado ou o primeiro que achar)
           MANIFEST_PATH=$(git diff --name-only HEAD^ HEAD | grep "manifest.json" | head -n 1)
-          
           if [ -z "$MANIFEST_PATH" ]; then
             MANIFEST_PATH=$(find . -name "manifest.json" -not -path "*/.*" | head -n 1 | sed 's|./||')
           fi
+          echo "Manifesto: $MANIFEST_PATH"
 
-          echo "Manifesto encontrado em: $MANIFEST_PATH"
-
-          # Pega a ação (apply/destroy)
+          # 2. Extrai a Ação
           ACTION=$(jq -r '.action' "$MANIFEST_PATH")
           
-          # Pega os estágios. Se for destroy, inverte a ordem da lista principal
+          # 3. Normaliza a lista de states:
+          # Se for destroy, inverte a ordem. Transforma tudo em lista de listas para o loop.
           if [ "$ACTION" == "destroy" ]; then
-            STAGES=$(jq -c '.stages | reverse | .[]' "$MANIFEST_PATH")
+            STAGES_JSON=$(jq -c '.states | reverse | .[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
           else
-            STAGES=$(jq -c '.stages[]' "$MANIFEST_PATH")
+            STAGES_JSON=$(jq -c '.states[] | if type == "array" then . else [.] end' "$MANIFEST_PATH")
           fi
 
+          # 4. Salva os outputs (usa Base64 para evitar quebras de linha/espaços no GitHub Actions)
           echo "action=$ACTION" >> $GITHUB_OUTPUT
-          # Salva a lista de estágios formatada para o Bash
-          echo "stages_list=$(echo $STAGES | tr '\n' '|') " >> $GITHUB_OUTPUT
-          
-          echo "AÇÃO: $ACTION"
-          echo "STAGES: $STAGES"
+          echo "stages_list=$(echo "$STAGES_JSON" | base64 -w 0)" >> $GITHUB_OUTPUT
 
       - name: Configurar AWS (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
@@ -53,29 +52,29 @@ jobs:
 
       - uses: hashicorp/setup-terraform@v3
 
-      - name: Executar Pipeline
+      - name: Executar Pipeline Sequencial/Paralela
         run: |
           ACTION="${{ steps.flow.outputs.action }}"
-          # Converte a string de volta em lista usando o separador '|'
-          IFS='|' read -ra ADDR <<< "${{ steps.flow.outputs.stages_list }}"
-          
-          for group in "${ADDR[@]}"; do
+          # Decodifica a lista de estágios
+          STAGES=$(echo "${{ steps.flow.outputs.stages_list }}" | base64 -d)
+
+          # Loop linha a linha (cada linha é um grupo de execução)
+          while IFS= read -r group; do
             if [ -z "$group" ]; then continue; fi
             
-            # Extrai os itens do grupo (ex: vpc ou stateSub1 stateSub2)
-            # O 'if' abaixo trata se você passar uma lista simples ["a", "b"] ou aninhada [["a"], ["b"]]
-            items=$(echo $group | jq -r 'if type=="array" then .[] else . end')
+            # Extrai os nomes das pastas dentro do grupo
+            items=$(echo "$group" | jq -r '.[]')
             
-            echo "::group::Processando Estágio: $items"
+            echo "::group::Executando Estágio ($ACTION): $items"
             
             for item in $items; do
               (
-                echo ">>> Iniciando $item"
+                echo ">>> Processando: $item"
                 terraform -chdir=$item init -backend-config="key=$item/terraform.tfstate" -reconfigure > /dev/null
                 terraform -chdir=$item $ACTION -auto-approve
               ) & 
             done
 
-            wait # Espera o grupo paralelo terminar
+            wait # Sincroniza o paralelismo (espera as subnets antes da próxima etapa)
             echo "::endgroup::"
-          done
+          done <<< "$STAGES"
